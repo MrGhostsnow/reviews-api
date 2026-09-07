@@ -70,7 +70,15 @@ db.prepare(`INSERT OR IGNORE INTO Shop (shopDomain, judgemApiToken, plan)
 );
 
 app.use(cors({ origin: "*", methods: ["GET", "POST"] }));
-app.use(express.json());
+// verify captures the raw bytes for webhook HMAC checks without double-consuming
+// the request stream (a second raw-body reader before this would starve body-parser).
+app.use(
+  express.json({
+    verify: (req, res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
 
 // ---------------------------------------------------------------------------
 // Shop lookups — every route resolves the shop from the request, falling
@@ -590,6 +598,103 @@ app.post("/api/sync", verifyShopifyJWT, async (req, res) => {
     res.status(500).json({ error: "Sync failed", detail: err.message });
   }
 });
+
+// ---------------------------------------------------------------------------
+// GDPR webhooks — mandatory for Shopify App Store approval.
+// All three are HMAC-signed with the app's client secret (verification
+// skipped only when SHOPIFY_CLIENT_SECRET is unset, i.e. local dev).
+// ---------------------------------------------------------------------------
+function verifyWebhookHMAC(req, res, next) {
+  const hmacHeader = req.headers["x-shopify-hmac-sha256"];
+  const secret = process.env.SHOPIFY_CLIENT_SECRET;
+
+  if (!secret) {
+    console.warn("[webhook] SHOPIFY_CLIENT_SECRET not set — skipping HMAC verification (dev mode)");
+    return next();
+  }
+
+  if (!hmacHeader) {
+    return res.status(401).json({ error: "Missing HMAC header" });
+  }
+
+  const digest = crypto
+    .createHmac("sha256", secret)
+    .update(req.rawBody || Buffer.alloc(0))
+    .digest("base64");
+
+  if (digest !== hmacHeader) {
+    console.warn("[webhook] Invalid HMAC signature");
+    return res.status(401).json({ error: "Invalid HMAC signature" });
+  }
+
+  next();
+}
+
+// Customer requests to see what data we have about them. We store only
+// reviews synced from Judge.me (attributed by reviewerName) plus shop
+// config — no personal data submitted directly by end customers.
+function handleCustomersDataRequest(req, res) {
+  console.log("[webhook] customers/data_request received:", {
+    shopDomain: req.body?.shop_domain,
+    customerId: req.body?.customer?.id,
+  });
+  res.status(200).json({ message: "Acknowledged" });
+}
+
+// Customer requests deletion of their data. Reviews are sourced from
+// Judge.me — if deleted there, they drop out on the next sync.
+function handleCustomersRedact(req, res) {
+  console.log("[webhook] customers/redact received:", {
+    shopDomain: req.body?.shop_domain,
+    customerId: req.body?.customer?.id,
+  });
+  res.status(200).json({ message: "Acknowledged" });
+}
+
+// Fired 48h after a shop uninstalls — delete all data for that shop.
+function handleShopRedact(req, res) {
+  const shopDomain = req.body?.shop_domain || req.body?.myshopify_domain;
+  console.log("[webhook] shop/redact received for:", shopDomain);
+
+  if (shopDomain) {
+    try {
+      const deletedReviews = db.prepare("DELETE FROM Review WHERE shopDomain = ?").run(shopDomain);
+      db.prepare("DELETE FROM Shop WHERE shopDomain = ?").run(shopDomain);
+      console.log(`[webhook] shop/redact: deleted ${deletedReviews.changes} reviews and shop record for ${shopDomain}`);
+    } catch (err) {
+      console.error("[webhook] shop/redact error:", err.message);
+      // Still return 200 — Shopify does not retry on 200
+    }
+  }
+
+  res.status(200).json({ message: "Acknowledged" });
+}
+
+// Shopify's compliance_topics config posts all three GDPR topics to this
+// single URI, distinguished by the X-Shopify-Topic header.
+const GDPR_WEBHOOK_HANDLERS = {
+  "customers/data_request": handleCustomersDataRequest,
+  "customers/redact": handleCustomersRedact,
+  "shop/redact": handleShopRedact,
+};
+
+app.post("/webhooks", verifyWebhookHMAC, (req, res) => {
+  const topic = req.headers["x-shopify-topic"];
+  const handler = GDPR_WEBHOOK_HANDLERS[topic];
+
+  if (!handler) {
+    console.warn(`[webhook] Unknown or missing X-Shopify-Topic: ${topic}`);
+    return res.status(404).json({ error: "Unknown webhook topic" });
+  }
+
+  handler(req, res);
+});
+
+// Individual routes kept for local testing (curl/Postman without needing
+// to set X-Shopify-Topic).
+app.post("/webhooks/customers/data_request", verifyWebhookHMAC, handleCustomersDataRequest);
+app.post("/webhooks/customers/redact", verifyWebhookHMAC, handleCustomersRedact);
+app.post("/webhooks/shop/redact", verifyWebhookHMAC, handleShopRedact);
 
 // ---------------------------------------------------------------------------
 // Startup
