@@ -4,7 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node tests/api.test.js",
+    "test:prod": "BASE_URL=https://reviews-api-production-10bf.up.railway.app node tests/api.test.js",
     "start": "node server.js"
   },
   "keywords": [],
