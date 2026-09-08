@@ -160,9 +160,13 @@ function verifyShopifyJWT(req, res, next) {
   }
 }
 
-// Only falls back to the .env token for the shop .env is configured for —
-// otherwise an unconfigured shop domain would incorrectly borrow it.
-function devFallbackToken(shopDomain) {
+// Only falls back to the .env token for local dev calls — never for
+// requests arriving through Shopify's App Proxy (identified by the
+// x-shopify-shop-domain header it adds), so a disconnected shop in
+// production gets a real 503 instead of silently borrowing the .env
+// token configured for a different (dev) shop.
+function devFallbackToken(req, shopDomain) {
+  if (req.headers["x-shopify-shop-domain"]) return undefined;
   return shopDomain === process.env.JUDGEME_SHOP_DOMAIN
     ? process.env.JUDGEME_API_TOKEN
     : undefined;
@@ -248,7 +252,7 @@ app.get("/api/reviews", (req, res) => {
   try {
     const shopDomain = resolveShopDomain(req);
     const shop = getShopFullStmt.get(shopDomain);
-    const apiToken = shop?.judgemApiToken || devFallbackToken(shopDomain);
+    const apiToken = shop?.judgemApiToken || devFallbackToken(req, shopDomain);
 
     if (!apiToken) {
       return res
@@ -578,7 +582,7 @@ app.post("/api/sync", verifyShopifyJWT, async (req, res) => {
   try {
     const shopDomain = resolveShopDomain(req);
     const shop = getShopFullStmt.get(shopDomain);
-    const apiToken = shop?.judgemApiToken || devFallbackToken(shopDomain);
+    const apiToken = shop?.judgemApiToken || devFallbackToken(req, shopDomain);
 
     if (!apiToken) {
       return res
