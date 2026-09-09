@@ -279,9 +279,20 @@ app.get("/api/reviews", (req, res) => {
         ? Math.min(requestedCount, MAX_COUNT)
         : DEFAULT_COUNT;
 
+    const conditions = ["shopDomain = ?"];
+    const params = [shopDomain];
+
+    const productId = parseInt(req.query.productId, 10);
+    if (Number.isInteger(productId) && productId > 0) {
+      conditions.push("productExternalId = ?");
+      params.push(productId);
+    }
+
+    const whereClause = conditions.join(" AND ");
+
     const reviews = db
-      .prepare(`SELECT * FROM Review WHERE shopDomain = ? ORDER BY ${orderBy} LIMIT ?`)
-      .all(shopDomain, count);
+      .prepare(`SELECT * FROM Review WHERE ${whereClause} ORDER BY ${orderBy} LIMIT ?`)
+      .all(...params, count);
 
     const formatted = reviews.map((r) => ({
       ...r,
@@ -442,6 +453,12 @@ app.get("/api/admin/reviews", verifyShopifyJWT, (req, res) => {
       conditions.push("(body LIKE ? OR reviewerName LIKE ?)");
       const like = `%${search}%`;
       params.push(like, like);
+    }
+
+    const productId = parseInt(req.query.productId, 10);
+    if (Number.isInteger(productId) && productId > 0) {
+      conditions.push("productExternalId = ?");
+      params.push(productId);
     }
 
     const whereClause = conditions.join(" AND ");
