@@ -307,6 +307,7 @@ app.get("/api/reviews", (req, res) => {
       template,
       upgradeRequired,
       sort,
+      plan,
     });
   } catch (err) {
     console.error("Error reading from database:", err.message);
