@@ -663,7 +663,10 @@ async function exchangeSessionTokenForAccessToken(shopDomain, sessionToken) {
       grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
       subject_token: sessionToken,
       subject_token_type: "urn:ietf:params:oauth:token-type:id_token",
-      requested_token_type: "urn:ietf:params:oauth:token-type:offline_access_token",
+      // Shopify's own URN namespace, not the generic IETF one — the IETF
+      // form ("urn:ietf:...:offline_access_token") is what was here before
+      // and is rejected with "invalid_requested_token_type".
+      requested_token_type: "urn:shopify:params:oauth:token-type:offline-access-token",
     }),
   });
 
