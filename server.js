@@ -805,8 +805,16 @@ app.get("/api/billing/upgrade", verifyShopifyJWT, async (req, res) => {
       // re-exchanges instead of reusing the bad token; but the actual fix
       // is the merchant reinstalling the app, which is the only thing that
       // gets Shopify to issue a fresh, expiring grant.
-      const staleTokenError = (data.errors || []).some((e) =>
-        /non-expiring access token/i.test(e.message || "")
+      //
+      // data.errors isn't always an array of {message} objects the way a
+      // normal GraphQL query error is — an outright auth failure (e.g. the
+      // token was since revoked) comes back as data.errors: "some string"
+      // instead, which .some() previously choked on.
+      const errorText = Array.isArray(data.errors)
+        ? data.errors.map((e) => (typeof e === "string" ? e : e?.message || "")).join(" | ")
+        : String(data.errors ?? "");
+      const staleTokenError = /non-expiring access token|invalid api key or access token/i.test(
+        errorText
       );
       if (staleTokenError) {
         setShopAccessTokenStmt.run(null, shopDomain);
