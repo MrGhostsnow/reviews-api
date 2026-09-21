@@ -667,6 +667,11 @@ async function exchangeSessionTokenForAccessToken(shopDomain, sessionToken) {
       // form ("urn:ietf:...:offline_access_token") is what was here before
       // and is rejected with "invalid_requested_token_type".
       requested_token_type: "urn:shopify:params:oauth:token-type:offline-access-token",
+      // Without this, Shopify defaults to a non-expiring offline token —
+      // confirmed via production logs (hasExpiresIn: false on every
+      // exchange, even after a real uninstall+reinstall) and Shopify's own
+      // token-exchange docs: "expiring" is 0 (non-expiring) unless set to 1.
+      expiring: 1,
     }),
   });
 
