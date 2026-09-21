@@ -667,12 +667,36 @@ async function exchangeSessionTokenForAccessToken(shopDomain, sessionToken) {
     }),
   });
 
+  // Read as text first — the error path needs the raw body even when it
+  // isn't valid JSON (Shopify sometimes returns an HTML/plain-text error
+  // page for auth failures), and a body can only be consumed once.
+  const rawBody = await response.text().catch(() => "");
+
   if (!response.ok) {
-    const detail = await response.text().catch(() => "");
-    throw new Error(`Token exchange failed (${response.status}): ${detail}`);
+    // Full diagnostic dump so a token-exchange failure is debuggable from
+    // Railway logs alone — status/headers/body from Shopify, plus whether
+    // our own config looks sane (never the secret values themselves).
+    console.error("[billing] token exchange failed", {
+      shopDomain,
+      status: response.status,
+      statusText: response.statusText,
+      headers: Object.fromEntries(response.headers.entries()),
+      body: rawBody,
+      clientIdConfigured: !!process.env.SHOPIFY_API_KEY,
+      clientSecretConfigured: !!process.env.SHOPIFY_CLIENT_SECRET,
+      sessionTokenLength: sessionToken ? sessionToken.length : 0,
+    });
+    throw new Error(`Token exchange failed (${response.status}): ${rawBody}`);
   }
 
-  const data = await response.json();
+  let data;
+  try {
+    data = JSON.parse(rawBody);
+  } catch (err) {
+    console.error("[billing] token exchange returned a non-JSON body", { shopDomain, rawBody });
+    throw new Error("Token exchange returned an unparseable response");
+  }
+
   return data.access_token;
 }
 
