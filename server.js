@@ -700,6 +700,20 @@ async function exchangeSessionTokenForAccessToken(shopDomain, sessionToken) {
     throw new Error("Token exchange returned an unparseable response");
   }
 
+  // Diagnostic: token exchange itself is succeeding, but the downstream
+  // GraphQL call keeps rejecting the token as non-expiring even after a
+  // real uninstall+reinstall — this logs exactly what Shopify granted
+  // (never the token itself) so we can tell expiring vs. non-expiring
+  // apart from the response shape instead of guessing.
+  console.log("[billing] token exchange succeeded", {
+    shopDomain,
+    hasExpiresIn: Object.prototype.hasOwnProperty.call(data, "expires_in"),
+    expiresIn: data.expires_in,
+    scope: data.scope,
+    tokenPrefix: data.access_token ? data.access_token.slice(0, 7) : null,
+    tokenLength: data.access_token ? data.access_token.length : 0,
+  });
+
   return data.access_token;
 }
 
