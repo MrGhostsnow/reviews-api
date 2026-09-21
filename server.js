@@ -797,6 +797,25 @@ app.get("/api/billing/upgrade", verifyShopifyJWT, async (req, res) => {
 
     if (!result || data.errors?.length > 0) {
       console.error("[billing] appSubscriptionCreate GraphQL error:", data.errors || data);
+
+      // A stale/legacy non-expiring token (the shop's grant predates
+      // Shopify's expiring-token rollout) reads back fine from token
+      // exchange but is rejected here — retrying with the same token would
+      // just fail the same way forever. Clear it so the next attempt
+      // re-exchanges instead of reusing the bad token; but the actual fix
+      // is the merchant reinstalling the app, which is the only thing that
+      // gets Shopify to issue a fresh, expiring grant.
+      const staleTokenError = (data.errors || []).some((e) =>
+        /non-expiring access token/i.test(e.message || "")
+      );
+      if (staleTokenError) {
+        setShopAccessTokenStmt.run(null, shopDomain);
+        return res.status(401).json({
+          error:
+            "Your app installation is out of date and can no longer authorize billing. Please uninstall and reinstall the app, then try again.",
+        });
+      }
+
       return res.status(502).json({ error: "Shopify billing request failed" });
     }
 
