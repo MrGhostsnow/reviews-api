@@ -530,6 +530,51 @@ await runTest('Suite 12: the real shop is untouched by the fake shop/redact call
 });
 
 // ---------------------------------------------------------------------------
+// Suite 13: Billing (GET /api/billing/upgrade, GET /api/billing/confirm)
+//
+// Full end-to-end coverage (a real appSubscriptionCreate + approval) isn't
+// possible from an automated suite — it needs a real Shopify session token
+// and a merchant clicking "Approve" in the browser. These tests instead
+// cover the parts that don't require that: auth gating, unknown-shop
+// handling, and confirm's input validation.
+// ---------------------------------------------------------------------------
+await runTest('Suite 13: GET /api/billing/upgrade without auth returns 401', async () => {
+  if (!SHOPIFY_CLIENT_SECRET) return 'SKIP'; // JWT check no-ops without the secret
+  const res = await fetch(`${BASE_URL}/api/billing/upgrade`);
+  assert.equal(res.status, 401);
+});
+
+await runTest('Suite 13: GET /api/billing/upgrade for an unknown shop returns 404', async () => {
+  const { status, body } = await api('/api/billing/upgrade', {}, FAKE_SHOP_DOMAIN);
+  assert.equal(status, 404);
+  assert.equal(body.error, 'Shop not found');
+});
+
+await runTest('Suite 13: GET /api/billing/upgrade without a real session token fails gracefully', async () => {
+  // The real shop has no stored shopifyAccessToken yet, so this exercises
+  // the token-exchange path — the JWT this suite signs isn't a genuine
+  // Shopify session token, so Shopify's token exchange rejects it and the
+  // route must surface a clean 503, never a 500 or an unhandled rejection.
+  const { status, body } = await api('/api/billing/upgrade');
+  assert.equal(status, 503);
+  assert.ok(body.error);
+});
+
+await runTest('Suite 13: GET /api/billing/confirm with missing params returns 400', async () => {
+  const res = await fetch(`${BASE_URL}/api/billing/confirm`);
+  assert.equal(res.status, 400);
+});
+
+await runTest('Suite 13: GET /api/billing/confirm for a shop with no access token redirects with billing=error', async () => {
+  const res = await fetch(
+    `${BASE_URL}/api/billing/confirm?shop=${FAKE_SHOP_DOMAIN}&charge_id=123`,
+    { redirect: 'manual' }
+  );
+  assert.equal(res.status, 302);
+  assert.match(res.headers.get('location') || '', /billing=error/);
+});
+
+// ---------------------------------------------------------------------------
 // Cleanup — restore plan to "free" and sync interval to the default (60).
 // ---------------------------------------------------------------------------
 try {

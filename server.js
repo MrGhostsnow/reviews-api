@@ -63,6 +63,18 @@ if (!shopColumns.includes("syncInterval")) {
   db.exec("ALTER TABLE Shop ADD COLUMN syncInterval INTEGER DEFAULT 60");
 }
 
+// shopifyAccessToken: Admin API token obtained via token exchange (see
+// exchangeSessionTokenForAccessToken), needed for billing GraphQL/REST calls.
+// shopifyChargeId: the active recurring_application_charge id, for reference.
+if (!shopColumns.includes("shopifyAccessToken")) {
+  db.exec("ALTER TABLE Shop ADD COLUMN shopifyAccessToken TEXT");
+  console.log("[db] Added shopifyAccessToken column to Shop");
+}
+if (!shopColumns.includes("shopifyChargeId")) {
+  db.exec("ALTER TABLE Shop ADD COLUMN shopifyChargeId TEXT");
+  console.log("[db] Added shopifyChargeId column to Shop");
+}
+
 db.prepare(`INSERT OR IGNORE INTO Shop (shopDomain, judgemApiToken, plan)
   VALUES (?, ?, 'free')`).run(
   process.env.JUDGEME_SHOP_DOMAIN,
@@ -154,6 +166,10 @@ function verifyShopifyJWT(req, res, next) {
     }
 
     req.verifiedShopDomain = shopDomain;
+    // Kept so billing routes can exchange it for a real Admin API access
+    // token (see exchangeSessionTokenForAccessToken) without trusting any
+    // token value the client claims to have.
+    req.sessionToken = token;
     next();
   } catch (err) {
     return res.status(401).json({ error: `Unauthorized: ${err.message}` });
@@ -622,6 +638,192 @@ app.post("/api/sync", verifyShopifyJWT, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Billing — Shopify Managed Pricing recurring charge (Pro plan, $11.99/mo,
+// 7-day trial). App URL this server itself runs at, used as the base for
+// the appSubscriptionCreate returnUrl (Shopify redirects the merchant's
+// browser straight to it, appending ?charge_id=...).
+// ---------------------------------------------------------------------------
+const APP_URL = process.env.APP_URL || "https://reviews-api-production-10bf.up.railway.app";
+const PRO_PLAN_PRICE = { amount: 11.99, currencyCode: "USD" };
+const PRO_PLAN_TRIAL_DAYS = 7;
+
+// Exchanges the already-HMAC-verified App Bridge session token (JWT) for a
+// real Shopify Admin API access token, via Shopify's token exchange grant.
+// This is what actually captures the access token this app needs for
+// billing — no client-submitted token is ever trusted, since forging one
+// would let anyone overwrite another shop's stored credential.
+// https://shopify.dev/docs/apps/build/authentication-authorization/access-tokens/token-exchange
+async function exchangeSessionTokenForAccessToken(shopDomain, sessionToken) {
+  const response = await fetch(`https://${shopDomain}/admin/oauth/access_token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      client_id: process.env.SHOPIFY_API_KEY,
+      client_secret: process.env.SHOPIFY_CLIENT_SECRET,
+      grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
+      subject_token: sessionToken,
+      subject_token_type: "urn:ietf:params:oauth:token-type:id_token",
+      requested_token_type: "urn:ietf:params:oauth:token-type:offline_access_token",
+    }),
+  });
+
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    throw new Error(`Token exchange failed (${response.status}): ${detail}`);
+  }
+
+  const data = await response.json();
+  return data.access_token;
+}
+
+const setShopAccessTokenStmt = db.prepare(
+  "UPDATE Shop SET shopifyAccessToken = ?, updatedAt = datetime('now') WHERE shopDomain = ?"
+);
+const setShopChargeStmt = db.prepare(
+  "UPDATE Shop SET plan = 'pro', shopifyChargeId = ?, updatedAt = datetime('now') WHERE shopDomain = ?"
+);
+
+// GET /api/billing/upgrade — called when the merchant clicks "Upgrade to
+// Pro". Ensures we hold a real Admin API access token for the shop
+// (fetching one via token exchange on first use), then creates a recurring
+// charge and returns Shopify's confirmation URL for the merchant to
+// approve.
+app.get("/api/billing/upgrade", verifyShopifyJWT, async (req, res) => {
+  const shopDomain = resolveShopDomain(req);
+  if (!shopDomain) return res.status(400).json({ error: "Missing shop domain" });
+
+  let shop = getShopFullStmt.get(shopDomain);
+  if (!shop) return res.status(404).json({ error: "Shop not found" });
+
+  if (!shop.shopifyAccessToken) {
+    if (!req.sessionToken) {
+      return res.status(503).json({
+        error: "Shopify access token not available. Please reload the app and try again.",
+      });
+    }
+    try {
+      const accessToken = await exchangeSessionTokenForAccessToken(shopDomain, req.sessionToken);
+      setShopAccessTokenStmt.run(accessToken, shopDomain);
+      shop = getShopFullStmt.get(shopDomain);
+    } catch (err) {
+      console.error("[billing] token exchange failed:", err.message);
+      return res.status(503).json({
+        error: "Could not obtain a Shopify access token. Please reload the app and try again.",
+      });
+    }
+  }
+
+  const query = `
+    mutation appSubscriptionCreate(
+      $name: String!
+      $lineItems: [AppSubscriptionLineItemInput!]!
+      $returnUrl: URL!
+      $trialDays: Int
+      $test: Boolean
+    ) {
+      appSubscriptionCreate(
+        name: $name
+        lineItems: $lineItems
+        returnUrl: $returnUrl
+        trialDays: $trialDays
+        test: $test
+      ) {
+        appSubscription { id status }
+        confirmationUrl
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const variables = {
+    name: "FlexReviews Pro",
+    returnUrl: `${APP_URL}/api/billing/confirm?shop=${encodeURIComponent(shopDomain)}`,
+    trialDays: PRO_PLAN_TRIAL_DAYS,
+    test: process.env.NODE_ENV !== "production",
+    lineItems: [
+      {
+        plan: {
+          appRecurringPricingDetails: {
+            price: PRO_PLAN_PRICE,
+            interval: "EVERY_30_DAYS",
+          },
+        },
+      },
+    ],
+  };
+
+  try {
+    const response = await fetch(
+      `https://${shopDomain}/admin/api/${process.env.SHOPIFY_API_VERSION}/graphql.json`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Shopify-Access-Token": shop.shopifyAccessToken,
+        },
+        body: JSON.stringify({ query, variables }),
+      }
+    );
+
+    const data = await response.json();
+    const result = data?.data?.appSubscriptionCreate;
+
+    if (!result || data.errors?.length > 0) {
+      console.error("[billing] appSubscriptionCreate GraphQL error:", data.errors || data);
+      return res.status(502).json({ error: "Shopify billing request failed" });
+    }
+
+    if (result.userErrors?.length > 0) {
+      return res.status(400).json({ error: result.userErrors[0].message });
+    }
+
+    res.json({ confirmationUrl: result.confirmationUrl });
+  } catch (err) {
+    console.error("[billing] upgrade error:", err.message);
+    res.status(502).json({ error: "Shopify billing request failed" });
+  }
+});
+
+// GET /api/billing/confirm — Shopify redirects the merchant's browser here
+// after they approve or decline the charge (returnUrl above, with
+// ?charge_id=... appended by Shopify). Verifies the charge is actually
+// active before flipping the shop to Pro, then bounces the merchant back
+// into the embedded app.
+app.get("/api/billing/confirm", async (req, res) => {
+  const { charge_id, shop } = req.query;
+
+  if (!charge_id || !shop) {
+    return res.status(400).send("Missing charge_id or shop");
+  }
+
+  const shopRecord = getShopFullStmt.get(shop);
+  if (!shopRecord?.shopifyAccessToken) {
+    return res.redirect(`https://${shop}/admin/apps/flexreviews?billing=error`);
+  }
+
+  try {
+    const response = await fetch(
+      `https://${shop}/admin/api/${process.env.SHOPIFY_API_VERSION}/recurring_application_charges/${charge_id}.json`,
+      { headers: { "X-Shopify-Access-Token": shopRecord.shopifyAccessToken } }
+    );
+
+    const data = await response.json();
+    const charge = data.recurring_application_charge;
+
+    if (charge?.status === "active" || charge?.status === "accepted") {
+      setShopChargeStmt.run(String(charge_id), shop);
+      console.log(`[billing] Shop ${shop} upgraded to Pro (charge: ${charge_id})`);
+      return res.redirect(`https://${shop}/admin/apps/flexreviews?billing=success`);
+    }
+
+    res.redirect(`https://${shop}/admin/apps/flexreviews?billing=cancelled`);
+  } catch (err) {
+    console.error("[billing] confirm error:", err.message);
+    res.redirect(`https://${shop}/admin/apps/flexreviews?billing=error`);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // GDPR webhooks — mandatory for Shopify App Store approval.
 // All three are HMAC-signed with the app's client secret (verification
 // skipped only when SHOPIFY_CLIENT_SECRET is unset, i.e. local dev).
@@ -692,17 +894,46 @@ function handleShopRedact(req, res) {
   res.status(200).json({ message: "Acknowledged" });
 }
 
-// Shopify's compliance_topics config posts all three GDPR topics to this
-// single URI, distinguished by the X-Shopify-Topic header.
-const GDPR_WEBHOOK_HANDLERS = {
+// Subscription status changed (created/activated/declined/cancelled/expired)
+// — keeps Shop.plan in sync even if the merchant never lands back on
+// /api/billing/confirm (e.g. they cancel from the Shopify billing page
+// directly, or a trial simply expires).
+async function handleAppSubscriptionsUpdate(req, res) {
+  const shopDomain = req.body?.shop_domain || req.headers["x-shopify-shop-domain"];
+  const subscription = req.body?.app_subscription;
+
+  console.log(`[billing webhook] subscription update for ${shopDomain}:`, subscription?.status);
+
+  if (shopDomain && subscription) {
+    if (["CANCELLED", "DECLINED", "EXPIRED"].includes(subscription.status)) {
+      db.prepare("UPDATE Shop SET plan = 'free', updatedAt = datetime('now') WHERE shopDomain = ?").run(
+        shopDomain
+      );
+      console.log(`[billing webhook] ${shopDomain} downgraded to free (status: ${subscription.status})`);
+    } else if (subscription.status === "ACTIVE") {
+      db.prepare("UPDATE Shop SET plan = 'pro', updatedAt = datetime('now') WHERE shopDomain = ?").run(
+        shopDomain
+      );
+      console.log(`[billing webhook] ${shopDomain} confirmed on Pro (status: ${subscription.status})`);
+    }
+  }
+
+  res.status(200).json({ message: "Acknowledged" });
+}
+
+// Shopify's compliance_topics config posts all three GDPR topics, plus the
+// billing subscription topic registered separately in shopify.app.toml, to
+// this single URI — each distinguished by the X-Shopify-Topic header.
+const WEBHOOK_HANDLERS = {
   "customers/data_request": handleCustomersDataRequest,
   "customers/redact": handleCustomersRedact,
   "shop/redact": handleShopRedact,
+  "app_subscriptions/update": handleAppSubscriptionsUpdate,
 };
 
 app.post("/webhooks", verifyWebhookHMAC, (req, res) => {
   const topic = req.headers["x-shopify-topic"];
-  const handler = GDPR_WEBHOOK_HANDLERS[topic];
+  const handler = WEBHOOK_HANDLERS[topic];
 
   if (!handler) {
     console.warn(`[webhook] Unknown or missing X-Shopify-Topic: ${topic}`);
