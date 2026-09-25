@@ -683,10 +683,123 @@ app.get("/api/billing/upgrade", verifyShopifyJWT, async (req, res) => {
   const shopDomain = resolveShopDomain(req);
   if (!shopDomain) return res.status(400).json({ error: "Missing shop domain" });
 
-  // The app uses Shopify App Pricing, so the Billing API is unavailable —
-  // send the merchant straight to Shopify's hosted plan selection page.
-  const pricingUrl = `https://${shopDomain}/admin/apps/${process.env.SHOPIFY_API_KEY}/pricing`;
-  return res.json({ pricingUrl });
+  let shop = getShopFullStmt.get(shopDomain);
+  if (!shop) return res.status(404).json({ error: "Shop not found" });
+
+  if (!shop.shopifyAccessToken) {
+    if (!req.sessionToken) {
+      return res.status(503).json({
+        error: "Shopify access token not available. Please reload the app and try again.",
+      });
+    }
+    try {
+      const accessToken = await exchangeSessionTokenForAccessToken(shopDomain, req.sessionToken);
+      setShopAccessTokenStmt.run(accessToken, shopDomain);
+      shop = getShopFullStmt.get(shopDomain);
+    } catch (err) {
+      console.error("[billing] token exchange failed:", err.message);
+      return res.status(503).json({
+        error: "Could not obtain a Shopify access token. Please reload the app and try again.",
+      });
+    }
+  }
+
+  const query = `
+    mutation appSubscriptionCreate(
+      $name: String!
+      $lineItems: [AppSubscriptionLineItemInput!]!
+      $returnUrl: URL!
+      $trialDays: Int
+      $test: Boolean
+    ) {
+      appSubscriptionCreate(
+        name: $name
+        lineItems: $lineItems
+        returnUrl: $returnUrl
+        trialDays: $trialDays
+        test: $test
+      ) {
+        appSubscription { id status }
+        confirmationUrl
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const variables = {
+    name: "FlexReviews Pro",
+    returnUrl: `${APP_URL}/api/billing/confirm?shop=${encodeURIComponent(shopDomain)}`,
+    trialDays: PRO_PLAN_TRIAL_DAYS,
+    test: process.env.NODE_ENV !== "production",
+    lineItems: [
+      {
+        plan: {
+          appRecurringPricingDetails: {
+            price: PRO_PLAN_PRICE,
+            interval: "EVERY_30_DAYS",
+          },
+        },
+      },
+    ],
+  };
+
+  try {
+    const response = await fetch(
+      `https://${shopDomain}/admin/api/${process.env.SHOPIFY_API_VERSION}/graphql.json`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Shopify-Access-Token": shop.shopifyAccessToken,
+        },
+        body: JSON.stringify({ query, variables }),
+      }
+    );
+
+    const data = await response.json();
+    const result = data?.data?.appSubscriptionCreate;
+
+    const pricingErrorText = [
+      ...(Array.isArray(data.errors)
+        ? data.errors.map((e) => (typeof e === "string" ? e : e?.message || ""))
+        : [String(data.errors ?? "")]),
+      ...(result?.userErrors ?? []).map((e) => e?.message || ""),
+    ].join(" | ");
+    if (/Cannot use the Billing API when on Shopify App Pricing/i.test(pricingErrorText)) {
+      return res.json({
+        pricingUrl: `https://${shopDomain}/admin/apps/${process.env.SHOPIFY_API_KEY}/pricing`,
+      });
+    }
+
+    if (!result || data.errors?.length > 0) {
+      console.error("[billing] appSubscriptionCreate GraphQL error:", data.errors || data);
+
+      const errorText = Array.isArray(data.errors)
+        ? data.errors.map((e) => (typeof e === "string" ? e : e?.message || "")).join(" | ")
+        : String(data.errors ?? "");
+      const staleTokenError = /non-expiring access token|invalid api key or access token/i.test(
+        errorText
+      );
+      if (staleTokenError) {
+        setShopAccessTokenStmt.run(null, shopDomain);
+        return res.status(401).json({
+          error:
+            "Your app installation is out of date and can no longer authorize billing. Please uninstall and reinstall the app, then try again.",
+        });
+      }
+
+      return res.status(502).json({ error: "Shopify billing request failed" });
+    }
+
+    if (result.userErrors?.length > 0) {
+      return res.status(400).json({ error: result.userErrors[0].message });
+    }
+
+    res.json({ confirmationUrl: result.confirmationUrl });
+  } catch (err) {
+    console.error("[billing] upgrade error:", err.message);
+    res.status(502).json({ error: "Shopify billing request failed" });
+  }
 });
 
 app.get("/api/billing/confirm", async (req, res) => {
