@@ -746,10 +746,10 @@ app.get("/api/billing/upgrade", verifyShopifyJWT, async (req, res) => {
       return res.status(502).json({ error: "Shopify billing request failed" });
     }
 
-    const storeHandle = shopDomain.replace(/\.myshopify\.com$/, "");
-    res.json({
-      pricingUrl: `https://admin.shopify.com/store/${storeHandle}/charges/${appHandle}/pricing_plans`,
-    });
+    // shopify:admin/ URLs are resolved by the admin itself — an absolute
+    // admin.shopify.com URL opened from the app home extension gets routed
+    // back into the app instead of reaching the plan selection page.
+    res.json({ pricingUrl: `shopify:admin/charges/${appHandle}/pricing_plans` });
   } catch (err) {
     console.error("[billing] upgrade error:", err.message);
     res.status(502).json({ error: "Shopify billing request failed" });
