@@ -56,16 +56,11 @@ db.exec(`
   )
 `);
 
-// Existing databases predate the syncInterval column — add it if missing
-// rather than dropping the table (Shop rows hold real merchant tokens).
 const shopColumns = db.prepare("PRAGMA table_info(Shop)").all().map((c) => c.name);
 if (!shopColumns.includes("syncInterval")) {
   db.exec("ALTER TABLE Shop ADD COLUMN syncInterval INTEGER DEFAULT 60");
 }
 
-// shopifyAccessToken: Admin API token obtained via token exchange (see
-// exchangeSessionTokenForAccessToken), needed for billing GraphQL/REST calls.
-// shopifyChargeId: the active recurring_application_charge id, for reference.
 if (!shopColumns.includes("shopifyAccessToken")) {
   db.exec("ALTER TABLE Shop ADD COLUMN shopifyAccessToken TEXT");
   console.log("[db] Added shopifyAccessToken column to Shop");
@@ -82,8 +77,7 @@ db.prepare(`INSERT OR IGNORE INTO Shop (shopDomain, judgemApiToken, plan)
 );
 
 app.use(cors({ origin: "*", methods: ["GET", "POST"] }));
-// verify captures the raw bytes for webhook HMAC checks without double-consuming
-// the request stream (a second raw-body reader before this would starve body-parser).
+
 app.use(
   express.json({
     verify: (req, res, buf) => {
@@ -92,11 +86,7 @@ app.use(
   })
 );
 
-// ---------------------------------------------------------------------------
-// Shop lookups — every route resolves the shop from the request, falling
-// back to JUDGEME_SHOP_DOMAIN/JUDGEME_API_TOKEN so local dev keeps working
-// without going through the onboarding UI.
-// ---------------------------------------------------------------------------
+
 const getShopFullStmt = db.prepare("SELECT * FROM Shop WHERE shopDomain = ?");
 const upsertShopTokenStmt = db.prepare(`
   INSERT INTO Shop (shopDomain, judgemApiToken, plan)
@@ -122,9 +112,6 @@ function resolveShopDomain(req) {
   );
 }
 
-// Verifies the Shopify session token (JWT) App Bridge attaches to embedded
-// app requests, so shopDomain can't be spoofed by the client. Skipped in dev
-// when SHOPIFY_CLIENT_SECRET isn't set.
 function verifyShopifyJWT(req, res, next) {
   if (!process.env.SHOPIFY_CLIENT_SECRET) {
     return next();
@@ -166,9 +153,6 @@ function verifyShopifyJWT(req, res, next) {
     }
 
     req.verifiedShopDomain = shopDomain;
-    // Kept so billing routes can exchange it for a real Admin API access
-    // token (see exchangeSessionTokenForAccessToken) without trusting any
-    // token value the client claims to have.
     req.sessionToken = token;
     next();
   } catch (err) {
@@ -176,11 +160,6 @@ function verifyShopifyJWT(req, res, next) {
   }
 }
 
-// Only falls back to the .env token for local dev calls — never for
-// requests arriving through Shopify's App Proxy (identified by the
-// x-shopify-shop-domain header it adds), so a disconnected shop in
-// production gets a real 503 instead of silently borrowing the .env
-// token configured for a different (dev) shop.
 function devFallbackToken(req, shopDomain) {
   if (req.headers["x-shopify-shop-domain"]) return undefined;
   return shopDomain === process.env.JUDGEME_SHOP_DOMAIN
@@ -637,22 +616,11 @@ app.post("/api/sync", verifyShopifyJWT, async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------------------
-// Billing — Shopify Managed Pricing recurring charge (Pro plan, $11.99/mo,
-// 7-day trial). App URL this server itself runs at, used as the base for
-// the appSubscriptionCreate returnUrl (Shopify redirects the merchant's
-// browser straight to it, appending ?charge_id=...).
-// ---------------------------------------------------------------------------
+
 const APP_URL = process.env.APP_URL || "https://reviews-api-production-10bf.up.railway.app";
 const PRO_PLAN_PRICE = { amount: 11.99, currencyCode: "USD" };
 const PRO_PLAN_TRIAL_DAYS = 7;
 
-// Exchanges the already-HMAC-verified App Bridge session token (JWT) for a
-// real Shopify Admin API access token, via Shopify's token exchange grant.
-// This is what actually captures the access token this app needs for
-// billing — no client-submitted token is ever trusted, since forging one
-// would let anyone overwrite another shop's stored credential.
-// https://shopify.dev/docs/apps/build/authentication-authorization/access-tokens/token-exchange
 async function exchangeSessionTokenForAccessToken(shopDomain, sessionToken) {
   const response = await fetch(`https://${shopDomain}/admin/oauth/access_token`, {
     method: "POST",
@@ -663,27 +631,14 @@ async function exchangeSessionTokenForAccessToken(shopDomain, sessionToken) {
       grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
       subject_token: sessionToken,
       subject_token_type: "urn:ietf:params:oauth:token-type:id_token",
-      // Shopify's own URN namespace, not the generic IETF one — the IETF
-      // form ("urn:ietf:...:offline_access_token") is what was here before
-      // and is rejected with "invalid_requested_token_type".
       requested_token_type: "urn:shopify:params:oauth:token-type:offline-access-token",
-      // Without this, Shopify defaults to a non-expiring offline token —
-      // confirmed via production logs (hasExpiresIn: false on every
-      // exchange, even after a real uninstall+reinstall) and Shopify's own
-      // token-exchange docs: "expiring" is 0 (non-expiring) unless set to 1.
       expiring: 1,
     }),
   });
 
-  // Read as text first — the error path needs the raw body even when it
-  // isn't valid JSON (Shopify sometimes returns an HTML/plain-text error
-  // page for auth failures), and a body can only be consumed once.
   const rawBody = await response.text().catch(() => "");
 
   if (!response.ok) {
-    // Full diagnostic dump so a token-exchange failure is debuggable from
-    // Railway logs alone — status/headers/body from Shopify, plus whether
-    // our own config looks sane (never the secret values themselves).
     console.error("[billing] token exchange failed", {
       shopDomain,
       status: response.status,
@@ -705,11 +660,6 @@ async function exchangeSessionTokenForAccessToken(shopDomain, sessionToken) {
     throw new Error("Token exchange returned an unparseable response");
   }
 
-  // Diagnostic: token exchange itself is succeeding, but the downstream
-  // GraphQL call keeps rejecting the token as non-expiring even after a
-  // real uninstall+reinstall — this logs exactly what Shopify granted
-  // (never the token itself) so we can tell expiring vs. non-expiring
-  // apart from the response shape instead of guessing.
   console.log("[billing] token exchange succeeded", {
     shopDomain,
     hasExpiresIn: Object.prototype.hasOwnProperty.call(data, "expires_in"),
@@ -729,11 +679,6 @@ const setShopChargeStmt = db.prepare(
   "UPDATE Shop SET plan = 'pro', shopifyChargeId = ?, updatedAt = datetime('now') WHERE shopDomain = ?"
 );
 
-// GET /api/billing/upgrade — called when the merchant clicks "Upgrade to
-// Pro". Ensures we hold a real Admin API access token for the shop
-// (fetching one via token exchange on first use), then creates a recurring
-// charge and returns Shopify's confirmation URL for the merchant to
-// approve.
 app.get("/api/billing/upgrade", verifyShopifyJWT, async (req, res) => {
   const shopDomain = resolveShopDomain(req);
   if (!shopDomain) return res.status(400).json({ error: "Missing shop domain" });
@@ -814,21 +759,21 @@ app.get("/api/billing/upgrade", verifyShopifyJWT, async (req, res) => {
     const data = await response.json();
     const result = data?.data?.appSubscriptionCreate;
 
+    const pricingErrorText = [
+      ...(Array.isArray(data.errors)
+        ? data.errors.map((e) => (typeof e === "string" ? e : e?.message || ""))
+        : [String(data.errors ?? "")]),
+      ...(result?.userErrors ?? []).map((e) => e?.message || ""),
+    ].join(" | ");
+    if (/Cannot use the Billing API when on Shopify App Pricing/i.test(pricingErrorText)) {
+      return res.json({
+        pricingUrl: `https://${shopDomain}/admin/apps/${process.env.SHOPIFY_API_KEY}/pricing`,
+      });
+    }
+
     if (!result || data.errors?.length > 0) {
       console.error("[billing] appSubscriptionCreate GraphQL error:", data.errors || data);
 
-      // A stale/legacy non-expiring token (the shop's grant predates
-      // Shopify's expiring-token rollout) reads back fine from token
-      // exchange but is rejected here — retrying with the same token would
-      // just fail the same way forever. Clear it so the next attempt
-      // re-exchanges instead of reusing the bad token; but the actual fix
-      // is the merchant reinstalling the app, which is the only thing that
-      // gets Shopify to issue a fresh, expiring grant.
-      //
-      // data.errors isn't always an array of {message} objects the way a
-      // normal GraphQL query error is — an outright auth failure (e.g. the
-      // token was since revoked) comes back as data.errors: "some string"
-      // instead, which .some() previously choked on.
       const errorText = Array.isArray(data.errors)
         ? data.errors.map((e) => (typeof e === "string" ? e : e?.message || "")).join(" | ")
         : String(data.errors ?? "");
@@ -857,11 +802,6 @@ app.get("/api/billing/upgrade", verifyShopifyJWT, async (req, res) => {
   }
 });
 
-// GET /api/billing/confirm — Shopify redirects the merchant's browser here
-// after they approve or decline the charge (returnUrl above, with
-// ?charge_id=... appended by Shopify). Verifies the charge is actually
-// active before flipping the shop to Pro, then bounces the merchant back
-// into the embedded app.
 app.get("/api/billing/confirm", async (req, res) => {
   const { charge_id, shop } = req.query;
 
@@ -927,9 +867,6 @@ function verifyWebhookHMAC(req, res, next) {
   next();
 }
 
-// Customer requests to see what data we have about them. We store only
-// reviews synced from Judge.me (attributed by reviewerName) plus shop
-// config — no personal data submitted directly by end customers.
 function handleCustomersDataRequest(req, res) {
   console.log("[webhook] customers/data_request received:", {
     shopDomain: req.body?.shop_domain,
@@ -938,8 +875,6 @@ function handleCustomersDataRequest(req, res) {
   res.status(200).json({ message: "Acknowledged" });
 }
 
-// Customer requests deletion of their data. Reviews are sourced from
-// Judge.me — if deleted there, they drop out on the next sync.
 function handleCustomersRedact(req, res) {
   console.log("[webhook] customers/redact received:", {
     shopDomain: req.body?.shop_domain,
