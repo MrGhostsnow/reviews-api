@@ -381,13 +381,58 @@ app.post("/api/onboarding/connect", verifyShopifyJWT, async (req, res) => {
   res.json({ success: true, shopDomain, plan: shop.plan });
 });
 
-app.get("/api/onboarding/status", verifyShopifyJWT, (req, res) => {
+// With Shopify App Pricing the plan is chosen on Shopify's hosted page, so
+// the app_subscriptions/update webhook is the only push signal we get — if
+// it's missed or delayed, Shop.plan goes stale. Reads the shop's active
+// subscription straight from Shopify and corrects the stored plan. Falls
+// back to the stored plan on any failure (no token yet, network error).
+async function syncPlanFromShopify(shop) {
+  if (!shop?.shopifyAccessToken) return;
+
+  try {
+    const response = await fetch(
+      `https://${shop.shopDomain}/admin/api/${process.env.SHOPIFY_API_VERSION}/graphql.json`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Shopify-Access-Token": shop.shopifyAccessToken,
+        },
+        body: JSON.stringify({
+          query: "{ currentAppInstallation { activeSubscriptions { name status } } }",
+        }),
+      }
+    );
+    const data = await response.json();
+    const subscriptions = data?.data?.currentAppInstallation?.activeSubscriptions;
+
+    if (!Array.isArray(subscriptions)) {
+      console.error("[billing] plan sync GraphQL error:", data.errors || data);
+      return;
+    }
+
+    // Any active paid subscription means Pro; a "Free" managed plan (if
+    // Shopify records one) doesn't count.
+    const plan = subscriptions.some((s) => s.status === "ACTIVE" && !/^free$/i.test(s.name))
+      ? "pro"
+      : "free";
+    if (plan !== shop.plan) {
+      updateShopPlanStmt.run(plan, shop.shopDomain);
+      console.log(`[billing] plan sync: ${shop.shopDomain} ${shop.plan} -> ${plan}`);
+    }
+  } catch (err) {
+    console.error("[billing] plan sync failed:", err.message);
+  }
+}
+
+app.get("/api/onboarding/status", verifyShopifyJWT, async (req, res) => {
   const shopDomain = resolveShopDomain(req);
 
   if (!shopDomain) {
     return res.status(400).json({ error: "shopDomain is required" });
   }
 
+  await syncPlanFromShopify(getShopFullStmt.get(shopDomain));
   const shop = getShopFullStmt.get(shopDomain);
   const connected = !!shop?.judgemApiToken;
 
