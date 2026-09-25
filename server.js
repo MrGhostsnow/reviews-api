@@ -704,44 +704,11 @@ app.get("/api/billing/upgrade", verifyShopifyJWT, async (req, res) => {
     }
   }
 
-  const query = `
-    mutation appSubscriptionCreate(
-      $name: String!
-      $lineItems: [AppSubscriptionLineItemInput!]!
-      $returnUrl: URL!
-      $trialDays: Int
-      $test: Boolean
-    ) {
-      appSubscriptionCreate(
-        name: $name
-        lineItems: $lineItems
-        returnUrl: $returnUrl
-        trialDays: $trialDays
-        test: $test
-      ) {
-        appSubscription { id status }
-        confirmationUrl
-        userErrors { field message }
-      }
-    }
-  `;
-
-  const variables = {
-    name: "FlexReviews Pro",
-    returnUrl: `${APP_URL}/api/billing/confirm?shop=${encodeURIComponent(shopDomain)}`,
-    trialDays: PRO_PLAN_TRIAL_DAYS,
-    test: process.env.NODE_ENV !== "production",
-    lineItems: [
-      {
-        plan: {
-          appRecurringPricingDetails: {
-            price: PRO_PLAN_PRICE,
-            interval: "EVERY_30_DAYS",
-          },
-        },
-      },
-    ],
-  };
+  // The app uses Shopify App Pricing, so the Billing API can't create
+  // charges — the merchant picks a plan on Shopify's hosted pricing page
+  // instead. That page is keyed by the app handle, which we read from the
+  // Admin API rather than hardcoding it.
+  const query = "{ currentAppInstallation { app { handle } } }";
 
   try {
     const response = await fetch(
@@ -752,27 +719,15 @@ app.get("/api/billing/upgrade", verifyShopifyJWT, async (req, res) => {
           "Content-Type": "application/json",
           "X-Shopify-Access-Token": shop.shopifyAccessToken,
         },
-        body: JSON.stringify({ query, variables }),
+        body: JSON.stringify({ query }),
       }
     );
 
     const data = await response.json();
-    const result = data?.data?.appSubscriptionCreate;
+    const appHandle = data?.data?.currentAppInstallation?.app?.handle;
 
-    const pricingErrorText = [
-      ...(Array.isArray(data.errors)
-        ? data.errors.map((e) => (typeof e === "string" ? e : e?.message || ""))
-        : [String(data.errors ?? "")]),
-      ...(result?.userErrors ?? []).map((e) => e?.message || ""),
-    ].join(" | ");
-    if (/Cannot use the Billing API when on Shopify App Pricing/i.test(pricingErrorText)) {
-      return res.json({
-        pricingUrl: `https://${shopDomain}/admin/apps/${process.env.SHOPIFY_API_KEY}/pricing`,
-      });
-    }
-
-    if (!result || data.errors?.length > 0) {
-      console.error("[billing] appSubscriptionCreate GraphQL error:", data.errors || data);
+    if (!appHandle || data.errors?.length > 0) {
+      console.error("[billing] app handle lookup GraphQL error:", data.errors || data);
 
       const errorText = Array.isArray(data.errors)
         ? data.errors.map((e) => (typeof e === "string" ? e : e?.message || "")).join(" | ")
@@ -791,11 +746,10 @@ app.get("/api/billing/upgrade", verifyShopifyJWT, async (req, res) => {
       return res.status(502).json({ error: "Shopify billing request failed" });
     }
 
-    if (result.userErrors?.length > 0) {
-      return res.status(400).json({ error: result.userErrors[0].message });
-    }
-
-    res.json({ confirmationUrl: result.confirmationUrl });
+    const storeHandle = shopDomain.replace(/\.myshopify\.com$/, "");
+    res.json({
+      pricingUrl: `https://admin.shopify.com/store/${storeHandle}/charges/${appHandle}/pricing_plans`,
+    });
   } catch (err) {
     console.error("[billing] upgrade error:", err.message);
     res.status(502).json({ error: "Shopify billing request failed" });
