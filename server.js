@@ -386,8 +386,10 @@ app.post("/api/onboarding/connect", verifyShopifyJWT, async (req, res) => {
 // it's missed or delayed, Shop.plan goes stale. Reads the shop's active
 // subscription straight from Shopify and corrects the stored plan. Falls
 // back to the stored plan on any failure (no token yet, network error).
+// Returns "ok", "auth" (token expired/revoked — it's cleared so the caller
+// can re-exchange) or "error".
 async function syncPlanFromShopify(shop) {
-  if (!shop?.shopifyAccessToken) return;
+  if (!shop?.shopifyAccessToken) return "auth";
 
   try {
     const response = await fetch(
@@ -403,12 +405,19 @@ async function syncPlanFromShopify(shop) {
         }),
       }
     );
+    // Tokens from token exchange expire after ~1h; Shopify answers 401.
+    if (response.status === 401) {
+      setShopAccessTokenStmt.run(null, shop.shopDomain);
+      console.log(`[billing] plan sync: access token expired for ${shop.shopDomain}`);
+      return "auth";
+    }
+
     const data = await response.json();
     const subscriptions = data?.data?.currentAppInstallation?.activeSubscriptions;
 
     if (!Array.isArray(subscriptions)) {
       console.error("[billing] plan sync GraphQL error:", data.errors || data);
-      return;
+      return "error";
     }
 
     // Any active paid subscription means Pro; a "Free" managed plan (if
@@ -420,8 +429,10 @@ async function syncPlanFromShopify(shop) {
       updateShopPlanStmt.run(plan, shop.shopDomain);
       console.log(`[billing] plan sync: ${shop.shopDomain} ${shop.plan} -> ${plan}`);
     }
+    return "ok";
   } catch (err) {
     console.error("[billing] plan sync failed:", err.message);
+    return "error";
   }
 }
 
@@ -432,20 +443,19 @@ app.get("/api/onboarding/status", verifyShopifyJWT, async (req, res) => {
     return res.status(400).json({ error: "shopDomain is required" });
   }
 
-  // The plan sync needs an Admin API token; grab one via token exchange the
-  // first time the shop opens the app, instead of waiting for "Upgrade".
-  let existing = getShopFullStmt.get(shopDomain);
-  if (existing && !existing.shopifyAccessToken && req.sessionToken) {
+  // The plan sync needs an Admin API token. When there's none yet, or the
+  // stored one expired (they last ~1h), exchange this request's session
+  // token for a fresh one and retry once.
+  const existing = getShopFullStmt.get(shopDomain);
+  if (existing && (await syncPlanFromShopify(existing)) === "auth" && req.sessionToken) {
     try {
       const accessToken = await exchangeSessionTokenForAccessToken(shopDomain, req.sessionToken);
       setShopAccessTokenStmt.run(accessToken, shopDomain);
-      existing = getShopFullStmt.get(shopDomain);
+      await syncPlanFromShopify(getShopFullStmt.get(shopDomain));
     } catch (err) {
       console.error("[billing] token exchange for plan sync failed:", err.message);
     }
   }
-
-  await syncPlanFromShopify(existing);
   const shop = getShopFullStmt.get(shopDomain);
   const connected = !!shop?.judgemApiToken;
 
@@ -744,7 +754,9 @@ app.get("/api/billing/upgrade", verifyShopifyJWT, async (req, res) => {
   let shop = getShopFullStmt.get(shopDomain);
   if (!shop) return res.status(404).json({ error: "Shop not found" });
 
-  if (!shop.shopifyAccessToken) {
+  // Stored tokens expire after ~1h, so exchange for a fresh one whenever
+  // this request carries a session token — upgrade clicks are rare.
+  if (req.sessionToken || !shop.shopifyAccessToken) {
     if (!req.sessionToken) {
       return res.status(503).json({
         error: "Shopify access token not available. Please reload the app and try again.",
@@ -926,23 +938,21 @@ async function handleAppSubscriptionsUpdate(req, res) {
 
   // A single event describes one subscription, not the shop's current plan —
   // switching or re-subscribing sends CANCELLED for the *old* subscription
-  // while a new one is active. Ask Shopify for the full picture instead;
-  // only fall back to the event payload when we have no token to ask with.
+  // while a new one is active. Ask Shopify for the full picture instead.
   const shop = shopDomain ? getShopFullStmt.get(shopDomain) : null;
-  if (shop?.shopifyAccessToken) {
-    await syncPlanFromShopify(shop);
-  } else if (shopDomain && subscription) {
-    if (["CANCELLED", "DECLINED", "EXPIRED"].includes(subscription.status)) {
-      db.prepare("UPDATE Shop SET plan = 'free', updatedAt = datetime('now') WHERE shopDomain = ?").run(
-        shopDomain
-      );
-      console.log(`[billing webhook] ${shopDomain} downgraded to free (status: ${subscription.status})`);
-    } else if (subscription.status === "ACTIVE") {
-      db.prepare("UPDATE Shop SET plan = 'pro', updatedAt = datetime('now') WHERE shopDomain = ?").run(
-        shopDomain
-      );
-      console.log(`[billing webhook] ${shopDomain} confirmed on Pro (status: ${subscription.status})`);
-    }
+  const synced = shop ? (await syncPlanFromShopify(shop)) === "ok" : false;
+
+  // Without a usable token (none yet, or expired — webhooks carry no
+  // session token to exchange) only an ACTIVE event is safe to trust. A
+  // cancellation can't be told apart from a plan switch, so it's left for
+  // the next sync, which runs whenever the merchant opens the app.
+  if (!synced && shop && subscription?.status === "ACTIVE") {
+    updateShopPlanStmt.run("pro", shopDomain);
+    console.log(`[billing webhook] ${shopDomain} confirmed on Pro (status: ${subscription.status})`);
+  } else if (!synced && subscription) {
+    console.log(
+      `[billing webhook] ${shopDomain} ${subscription.status} not applied — no token to verify; will resync on next app open`
+    );
   }
 
   res.status(200).json({ message: "Acknowledged" });
