@@ -432,7 +432,20 @@ app.get("/api/onboarding/status", verifyShopifyJWT, async (req, res) => {
     return res.status(400).json({ error: "shopDomain is required" });
   }
 
-  await syncPlanFromShopify(getShopFullStmt.get(shopDomain));
+  // The plan sync needs an Admin API token; grab one via token exchange the
+  // first time the shop opens the app, instead of waiting for "Upgrade".
+  let existing = getShopFullStmt.get(shopDomain);
+  if (existing && !existing.shopifyAccessToken && req.sessionToken) {
+    try {
+      const accessToken = await exchangeSessionTokenForAccessToken(shopDomain, req.sessionToken);
+      setShopAccessTokenStmt.run(accessToken, shopDomain);
+      existing = getShopFullStmt.get(shopDomain);
+    } catch (err) {
+      console.error("[billing] token exchange for plan sync failed:", err.message);
+    }
+  }
+
+  await syncPlanFromShopify(existing);
   const shop = getShopFullStmt.get(shopDomain);
   const connected = !!shop?.judgemApiToken;
 
