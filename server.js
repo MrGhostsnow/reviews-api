@@ -911,7 +911,14 @@ async function handleAppSubscriptionsUpdate(req, res) {
 
   console.log(`[billing webhook] subscription update for ${shopDomain}:`, subscription?.status);
 
-  if (shopDomain && subscription) {
+  // A single event describes one subscription, not the shop's current plan —
+  // switching or re-subscribing sends CANCELLED for the *old* subscription
+  // while a new one is active. Ask Shopify for the full picture instead;
+  // only fall back to the event payload when we have no token to ask with.
+  const shop = shopDomain ? getShopFullStmt.get(shopDomain) : null;
+  if (shop?.shopifyAccessToken) {
+    await syncPlanFromShopify(shop);
+  } else if (shopDomain && subscription) {
     if (["CANCELLED", "DECLINED", "EXPIRED"].includes(subscription.status)) {
       db.prepare("UPDATE Shop SET plan = 'free', updatedAt = datetime('now') WHERE shopDomain = ?").run(
         shopDomain
