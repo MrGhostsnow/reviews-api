@@ -69,6 +69,18 @@ if (!shopColumns.includes("shopifyChargeId")) {
   db.exec("ALTER TABLE Shop ADD COLUMN shopifyChargeId TEXT");
   console.log("[db] Added shopifyChargeId column to Shop");
 }
+// Expiring offline tokens: the access token lasts ~1h and is renewed with
+// the refresh token. Expiry columns are epoch milliseconds.
+for (const [column, type] of [
+  ["shopifyRefreshToken", "TEXT"],
+  ["shopifyTokenExpiresAt", "INTEGER"],
+  ["shopifyRefreshTokenExpiresAt", "INTEGER"],
+]) {
+  if (!shopColumns.includes(column)) {
+    db.exec(`ALTER TABLE Shop ADD COLUMN ${column} ${type}`);
+    console.log(`[db] Added ${column} column to Shop`);
+  }
+}
 
 db.prepare(`INSERT OR IGNORE INTO Shop (shopDomain, judgemApiToken, plan)
   VALUES (?, ?, 'free')`).run(
@@ -386,29 +398,31 @@ app.post("/api/onboarding/connect", verifyShopifyJWT, async (req, res) => {
 // it's missed or delayed, Shop.plan goes stale. Reads the shop's active
 // subscription straight from Shopify and corrects the stored plan. Falls
 // back to the stored plan on any failure (no token yet, network error).
-// Returns "ok", "auth" (token expired/revoked — it's cleared so the caller
-// can re-exchange) or "error".
-async function syncPlanFromShopify(shop) {
-  if (!shop?.shopifyAccessToken) return "auth";
+// sessionToken is optional — webhooks have none and rely on the refresh
+// token. Returns "ok", "auth" (no usable token; a rejected one is cleared so
+// a retry re-exchanges) or "error".
+async function syncPlanFromShopify(shopDomain, sessionToken) {
+  const accessToken = await getValidAccessToken(shopDomain, sessionToken);
+  if (!accessToken) return "auth";
 
   try {
     const response = await fetch(
-      `https://${shop.shopDomain}/admin/api/${process.env.SHOPIFY_API_VERSION}/graphql.json`,
+      `https://${shopDomain}/admin/api/${process.env.SHOPIFY_API_VERSION}/graphql.json`,
       {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "X-Shopify-Access-Token": shop.shopifyAccessToken,
+          "X-Shopify-Access-Token": accessToken,
         },
         body: JSON.stringify({
           query: "{ currentAppInstallation { activeSubscriptions { name status } } }",
         }),
       }
     );
-    // Tokens from token exchange expire after ~1h; Shopify answers 401.
+    // Revoked (e.g. app reinstalled) despite not being past its expiry.
     if (response.status === 401) {
-      setShopAccessTokenStmt.run(null, shop.shopDomain);
-      console.log(`[billing] plan sync: access token expired for ${shop.shopDomain}`);
+      clearShopTokensStmt.run(shopDomain);
+      console.log(`[billing] plan sync: access token rejected for ${shopDomain}`);
       return "auth";
     }
 
@@ -425,9 +439,10 @@ async function syncPlanFromShopify(shop) {
     const plan = subscriptions.some((s) => s.status === "ACTIVE" && !/^free$/i.test(s.name))
       ? "pro"
       : "free";
-    if (plan !== shop.plan) {
-      updateShopPlanStmt.run(plan, shop.shopDomain);
-      console.log(`[billing] plan sync: ${shop.shopDomain} ${shop.plan} -> ${plan}`);
+    const currentPlan = getShopFullStmt.get(shopDomain)?.plan;
+    if (plan !== currentPlan) {
+      updateShopPlanStmt.run(plan, shopDomain);
+      console.log(`[billing] plan sync: ${shopDomain} ${currentPlan} -> ${plan}`);
     }
     return "ok";
   } catch (err) {
@@ -443,17 +458,11 @@ app.get("/api/onboarding/status", verifyShopifyJWT, async (req, res) => {
     return res.status(400).json({ error: "shopDomain is required" });
   }
 
-  // The plan sync needs an Admin API token. When there's none yet, or the
-  // stored one expired (they last ~1h), exchange this request's session
-  // token for a fresh one and retry once.
-  const existing = getShopFullStmt.get(shopDomain);
-  if (existing && (await syncPlanFromShopify(existing)) === "auth" && req.sessionToken) {
-    try {
-      const accessToken = await exchangeSessionTokenForAccessToken(shopDomain, req.sessionToken);
-      setShopAccessTokenStmt.run(accessToken, shopDomain);
-      await syncPlanFromShopify(getShopFullStmt.get(shopDomain));
-    } catch (err) {
-      console.error("[billing] token exchange for plan sync failed:", err.message);
+  // A rejected token is cleared by the first attempt, so the retry falls
+  // through to exchanging this request's session token for a fresh one.
+  if (getShopFullStmt.get(shopDomain)) {
+    if ((await syncPlanFromShopify(shopDomain, req.sessionToken)) === "auth") {
+      await syncPlanFromShopify(shopDomain, req.sessionToken);
     }
   }
   const shop = getShopFullStmt.get(shopDomain);
@@ -689,25 +698,24 @@ const APP_URL = process.env.APP_URL || "https://reviews-api-production-10bf.up.r
 const PRO_PLAN_PRICE = { amount: 11.99, currencyCode: "USD" };
 const PRO_PLAN_TRIAL_DAYS = 7;
 
-async function exchangeSessionTokenForAccessToken(shopDomain, sessionToken) {
+// POSTs to Shopify's OAuth token endpoint — shared by token exchange and
+// refresh. Returns the parsed body (access_token, expires_in, refresh_token,
+// refresh_token_expires_in, scope).
+async function requestShopifyToken(shopDomain, grant, label) {
   const response = await fetch(`https://${shopDomain}/admin/oauth/access_token`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       client_id: process.env.SHOPIFY_API_KEY,
       client_secret: process.env.SHOPIFY_CLIENT_SECRET,
-      grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
-      subject_token: sessionToken,
-      subject_token_type: "urn:ietf:params:oauth:token-type:id_token",
-      requested_token_type: "urn:shopify:params:oauth:token-type:offline-access-token",
-      expiring: 1,
+      ...grant,
     }),
   });
 
   const rawBody = await response.text().catch(() => "");
 
   if (!response.ok) {
-    console.error("[billing] token exchange failed", {
+    console.error(`[billing] ${label} failed`, {
       shopDomain,
       status: response.status,
       statusText: response.statusText,
@@ -715,34 +723,128 @@ async function exchangeSessionTokenForAccessToken(shopDomain, sessionToken) {
       body: rawBody,
       clientIdConfigured: !!process.env.SHOPIFY_API_KEY,
       clientSecretConfigured: !!process.env.SHOPIFY_CLIENT_SECRET,
-      sessionTokenLength: sessionToken ? sessionToken.length : 0,
     });
-    throw new Error(`Token exchange failed (${response.status}): ${rawBody}`);
+    throw new Error(`${label} failed (${response.status}): ${rawBody}`);
   }
 
   let data;
   try {
     data = JSON.parse(rawBody);
   } catch (err) {
-    console.error("[billing] token exchange returned a non-JSON body", { shopDomain, rawBody });
-    throw new Error("Token exchange returned an unparseable response");
+    console.error(`[billing] ${label} returned a non-JSON body`, { shopDomain, rawBody });
+    throw new Error(`${label} returned an unparseable response`);
   }
 
-  console.log("[billing] token exchange succeeded", {
+  console.log(`[billing] ${label} succeeded`, {
     shopDomain,
-    hasExpiresIn: Object.prototype.hasOwnProperty.call(data, "expires_in"),
     expiresIn: data.expires_in,
+    hasRefreshToken: !!data.refresh_token,
+    refreshTokenExpiresIn: data.refresh_token_expires_in,
     scope: data.scope,
-    tokenPrefix: data.access_token ? data.access_token.slice(0, 7) : null,
-    tokenLength: data.access_token ? data.access_token.length : 0,
   });
 
-  return data.access_token;
+  return data;
 }
 
-const setShopAccessTokenStmt = db.prepare(
-  "UPDATE Shop SET shopifyAccessToken = ?, updatedAt = datetime('now') WHERE shopDomain = ?"
-);
+function exchangeSessionTokenForAccessToken(shopDomain, sessionToken) {
+  return requestShopifyToken(
+    shopDomain,
+    {
+      grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
+      subject_token: sessionToken,
+      subject_token_type: "urn:ietf:params:oauth:token-type:id_token",
+      requested_token_type: "urn:shopify:params:oauth:token-type:offline-access-token",
+      expiring: 1,
+    },
+    "token exchange"
+  );
+}
+
+function refreshShopifyAccessToken(shopDomain, refreshToken) {
+  return requestShopifyToken(
+    shopDomain,
+    { grant_type: "refresh_token", refresh_token: refreshToken },
+    "token refresh"
+  );
+}
+
+const saveShopTokensStmt = db.prepare(`
+  UPDATE Shop SET shopifyAccessToken = ?, shopifyRefreshToken = ?, shopifyTokenExpiresAt = ?,
+    shopifyRefreshTokenExpiresAt = ?, updatedAt = datetime('now')
+  WHERE shopDomain = ?
+`);
+const clearShopTokensStmt = db.prepare(`
+  UPDATE Shop SET shopifyAccessToken = NULL, shopifyRefreshToken = NULL, shopifyTokenExpiresAt = NULL,
+    shopifyRefreshTokenExpiresAt = NULL, updatedAt = datetime('now')
+  WHERE shopDomain = ?
+`);
+
+function saveShopTokens(shopDomain, data) {
+  const now = Date.now();
+  saveShopTokensStmt.run(
+    data.access_token,
+    data.refresh_token ?? null,
+    data.expires_in ? now + data.expires_in * 1000 : null,
+    data.refresh_token_expires_in ? now + data.refresh_token_expires_in * 1000 : null,
+    shopDomain
+  );
+}
+
+// Renew a minute early so a token can't expire mid-request.
+const TOKEN_EXPIRY_MARGIN_MS = 60 * 1000;
+// Refresh tokens are single-use (each refresh returns a new one), so
+// concurrent requests for the same shop must share one refresh.
+const pendingTokenRequests = new Map();
+
+// Returns a usable Admin API access token for the shop, or null. Tries, in
+// order: the stored token if it isn't about to expire, a refresh with the
+// stored refresh token, then a token exchange with the request's session
+// token (when the caller has one — webhooks don't).
+function getValidAccessToken(shopDomain, sessionToken) {
+  const shop = getShopFullStmt.get(shopDomain);
+  if (!shop) return Promise.resolve(null);
+
+  const now = Date.now();
+  // A null expiry means a legacy non-expiring token.
+  if (
+    shop.shopifyAccessToken &&
+    (!shop.shopifyTokenExpiresAt || shop.shopifyTokenExpiresAt - TOKEN_EXPIRY_MARGIN_MS > now)
+  ) {
+    return Promise.resolve(shop.shopifyAccessToken);
+  }
+
+  if (pendingTokenRequests.has(shopDomain)) return pendingTokenRequests.get(shopDomain);
+
+  const request = (async () => {
+    const refreshUsable =
+      shop.shopifyRefreshToken &&
+      (!shop.shopifyRefreshTokenExpiresAt || shop.shopifyRefreshTokenExpiresAt > now);
+    if (refreshUsable) {
+      try {
+        const data = await refreshShopifyAccessToken(shopDomain, shop.shopifyRefreshToken);
+        saveShopTokens(shopDomain, data);
+        return data.access_token;
+      } catch (err) {
+        console.error("[billing] token refresh failed:", err.message);
+      }
+    }
+
+    if (sessionToken) {
+      try {
+        const data = await exchangeSessionTokenForAccessToken(shopDomain, sessionToken);
+        saveShopTokens(shopDomain, data);
+        return data.access_token;
+      } catch (err) {
+        console.error("[billing] token exchange failed:", err.message);
+      }
+    }
+
+    return null;
+  })().finally(() => pendingTokenRequests.delete(shopDomain));
+
+  pendingTokenRequests.set(shopDomain, request);
+  return request;
+}
 const setShopChargeStmt = db.prepare(
   "UPDATE Shop SET plan = 'pro', shopifyChargeId = ?, updatedAt = datetime('now') WHERE shopDomain = ?"
 );
@@ -751,27 +853,13 @@ app.get("/api/billing/upgrade", verifyShopifyJWT, async (req, res) => {
   const shopDomain = resolveShopDomain(req);
   if (!shopDomain) return res.status(400).json({ error: "Missing shop domain" });
 
-  let shop = getShopFullStmt.get(shopDomain);
-  if (!shop) return res.status(404).json({ error: "Shop not found" });
+  if (!getShopFullStmt.get(shopDomain)) return res.status(404).json({ error: "Shop not found" });
 
-  // Stored tokens expire after ~1h, so exchange for a fresh one whenever
-  // this request carries a session token — upgrade clicks are rare.
-  if (req.sessionToken || !shop.shopifyAccessToken) {
-    if (!req.sessionToken) {
-      return res.status(503).json({
-        error: "Shopify access token not available. Please reload the app and try again.",
-      });
-    }
-    try {
-      const accessToken = await exchangeSessionTokenForAccessToken(shopDomain, req.sessionToken);
-      setShopAccessTokenStmt.run(accessToken, shopDomain);
-      shop = getShopFullStmt.get(shopDomain);
-    } catch (err) {
-      console.error("[billing] token exchange failed:", err.message);
-      return res.status(503).json({
-        error: "Could not obtain a Shopify access token. Please reload the app and try again.",
-      });
-    }
+  const accessToken = await getValidAccessToken(shopDomain, req.sessionToken);
+  if (!accessToken) {
+    return res.status(503).json({
+      error: "Could not obtain a Shopify access token. Please reload the app and try again.",
+    });
   }
 
   // The app uses Shopify App Pricing, so the Billing API can't create
@@ -787,7 +875,7 @@ app.get("/api/billing/upgrade", verifyShopifyJWT, async (req, res) => {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "X-Shopify-Access-Token": shop.shopifyAccessToken,
+          "X-Shopify-Access-Token": accessToken,
         },
         body: JSON.stringify({ query }),
       }
@@ -806,7 +894,7 @@ app.get("/api/billing/upgrade", verifyShopifyJWT, async (req, res) => {
         errorText
       );
       if (staleTokenError) {
-        setShopAccessTokenStmt.run(null, shopDomain);
+        clearShopTokensStmt.run(shopDomain);
         return res.status(401).json({
           error:
             "Your app installation is out of date and can no longer authorize billing. Please uninstall and reinstall the app, then try again.",
@@ -833,15 +921,15 @@ app.get("/api/billing/confirm", async (req, res) => {
     return res.status(400).send("Missing charge_id or shop");
   }
 
-  const shopRecord = getShopFullStmt.get(shop);
-  if (!shopRecord?.shopifyAccessToken) {
+  const accessToken = await getValidAccessToken(shop);
+  if (!accessToken) {
     return res.redirect(`https://${shop}/admin/apps/flexreviews?billing=error`);
   }
 
   try {
     const response = await fetch(
       `https://${shop}/admin/api/${process.env.SHOPIFY_API_VERSION}/recurring_application_charges/${charge_id}.json`,
-      { headers: { "X-Shopify-Access-Token": shopRecord.shopifyAccessToken } }
+      { headers: { "X-Shopify-Access-Token": accessToken } }
     );
 
     const data = await response.json();
@@ -940,10 +1028,12 @@ async function handleAppSubscriptionsUpdate(req, res) {
   // switching or re-subscribing sends CANCELLED for the *old* subscription
   // while a new one is active. Ask Shopify for the full picture instead.
   const shop = shopDomain ? getShopFullStmt.get(shopDomain) : null;
-  const synced = shop ? (await syncPlanFromShopify(shop)) === "ok" : false;
+  // Webhooks carry no session token, so this relies on the stored refresh
+  // token to renew an expired access token.
+  const synced = shop ? (await syncPlanFromShopify(shopDomain)) === "ok" : false;
 
-  // Without a usable token (none yet, or expired — webhooks carry no
-  // session token to exchange) only an ACTIVE event is safe to trust. A
+  // Without a usable token (never obtained, or the refresh token itself
+  // expired/was revoked) only an ACTIVE event is safe to trust. A
   // cancellation can't be told apart from a plan switch, so it's left for
   // the next sync, which runs whenever the merchant opens the app.
   if (!synced && shop && subscription?.status === "ACTIVE") {
